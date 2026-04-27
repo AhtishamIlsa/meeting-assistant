@@ -1,34 +1,30 @@
 """
-AI Meeting Presenter — FastAPI backend
-Exposes REST + WebSocket APIs consumed by the dashboard and external services.
+AI Meeting Presenter — launcher
+────────────────────────────────
+Starts the slide server (FastAPI on :8080) and optionally immediately
+kicks off a presentation session if --meeting-url is provided.
+
+Usage:
+    # Open setup UI in your browser at http://localhost:8080, upload slides,
+    # enter a Zoom link and click Start:
+    python main.py
+
+    # Or start a session directly from the CLI:
+    python main.py --meeting-url "https://zoom.us/j/123456" --slides deck.pptx
 """
+import argparse
 import asyncio
 import logging
 import os
-from pathlib import Path
-from typing import Dict, List, Optional
+import signal
+import threading
 
-import aiofiles
-from fastapi import (
-    BackgroundTasks,
-    FastAPI,
-    File,
-    HTTPException,
-    UploadFile,
-    WebSocket,
-    WebSocketDisconnect,
-)
-from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
-from fastapi.staticfiles import StaticFiles
-from pydantic import BaseModel
+import uvicorn
 
 from config import config
-from orchestrator.session import PresentationSession, SessionEvent
-
-# ------------------------------------------------------------------ #
-# Bootstrap
-# ------------------------------------------------------------------ #
+from slide_server.app import app as slide_app
+from slide_server.app import manager as slide_manager
+from slide_server import app as slide_app_module
 
 logging.basicConfig(
     level=logging.INFO,
@@ -36,263 +32,109 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-for d in (config.UPLOAD_DIR, config.AUDIO_CACHE_DIR, config.SLIDE_IMAGE_DIR, "static"):
-    Path(d).mkdir(parents=True, exist_ok=True)
 
-app = FastAPI(
-    title="AI Meeting Presenter",
-    description="Autonomous AI sales presenter — joins meetings, presents slides, talks & listens.",
-    version="1.0.0",
-)
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-app.mount("/static", StaticFiles(directory="static"), name="static")
+# ------------------------------------------------------------------ #
+# Slide server thread
+# ------------------------------------------------------------------ #
 
-# In-memory session store (swap for Redis in production)
-sessions: Dict[str, PresentationSession] = {}
-ws_clients: Dict[str, List[WebSocket]] = {}
+def _run_slide_server():
+    uvicorn.run(
+        slide_app,
+        host=config.SLIDE_SERVER_HOST,
+        port=config.SLIDE_SERVER_PORT,
+        log_level="warning",
+    )
 
 
 # ------------------------------------------------------------------ #
-# WebSocket broadcast helper
+# Presenter agent
 # ------------------------------------------------------------------ #
 
-def _make_broadcaster(session_id: str):
-    async def broadcast(event: SessionEvent):
-        dead = []
-        for ws in ws_clients.get(session_id, []):
-            try:
-                await ws.send_json(event.to_dict())
-            except Exception:
-                dead.append(ws)
-        for ws in dead:
-            ws_clients[session_id].remove(ws)
-    return broadcast
+async def _run_presenter(meeting_url: str):
+    from presenter.agent import PresenterAgent
+    agent = PresenterAgent(slide_manager)
+    await agent.run(meeting_url)
+
+
+def _start_presenter(meeting_url: str):
+    """Called from slide server's /api/start endpoint or directly from CLI."""
+    asyncio.run(_run_presenter(meeting_url))
 
 
 # ------------------------------------------------------------------ #
-# Dashboard
+# Wire /api/start callback into the slide server
 # ------------------------------------------------------------------ #
 
-@app.get("/", include_in_schema=False)
-async def dashboard():
-    return FileResponse("static/index.html")
+def _setup_start_callback():
+    def _cb(meeting_url: str):
+        t = threading.Thread(target=_start_presenter, args=(meeting_url,), daemon=True)
+        t.start()
+        return asyncio.sleep(0)   # returns a coroutine for create_task
 
-
-# ------------------------------------------------------------------ #
-# Session management
-# ------------------------------------------------------------------ #
-
-@app.post("/api/sessions", summary="Create a new presentation session")
-async def create_session():
-    session = PresentationSession()
-    sessions[session.session_id] = session
-    ws_clients[session.session_id] = []
-    session.add_listener(_make_broadcaster(session.session_id))
-    logger.info("Session created: %s", session.session_id)
-    return {"session_id": session.session_id}
-
-
-@app.get("/api/sessions/{session_id}", summary="Get session status")
-async def get_session(session_id: str):
-    session = _get_or_404(session_id)
-    return session.status()
-
-
-@app.get("/api/sessions", summary="List all active sessions")
-async def list_sessions():
-    return [s.status() for s in sessions.values()]
-
-
-# ------------------------------------------------------------------ #
-# Slide upload
-# ------------------------------------------------------------------ #
-
-@app.post("/api/sessions/{session_id}/slides", summary="Upload presentation slides")
-async def upload_slides(session_id: str, file: UploadFile = File(...)):
-    session = _get_or_404(session_id)
-
-    ext = Path(file.filename).suffix.lower()
-    if ext not in (".pptx", ".ppt", ".pdf"):
-        raise HTTPException(400, f"Unsupported format '{ext}'. Use PPTX or PDF.")
-
-    dest = os.path.join(config.UPLOAD_DIR, f"{session_id}{ext}")
-    async with aiofiles.open(dest, "wb") as fh:
-        await fh.write(await file.read())
-
-    try:
-        count = session.load_slides(dest)
-    except Exception as exc:
-        raise HTTPException(422, f"Failed to parse slides: {exc}") from exc
-
-    return {"slides_count": count, "filename": file.filename}
-
-
-# ------------------------------------------------------------------ #
-# Start / Control / End
-# ------------------------------------------------------------------ #
-
-class StartRequest(BaseModel):
-    meeting_url: Optional[str] = None
-
-
-@app.post("/api/sessions/{session_id}/start", summary="Start the presentation")
-async def start_session(session_id: str, body: StartRequest = StartRequest()):
-    session = _get_or_404(session_id)
-    if not session.slides.total_slides:
-        raise HTTPException(400, "Upload slides before starting")
-    asyncio.create_task(session.start(meeting_url=body.meeting_url))
-    return {"message": "Presentation starting", "session_id": session_id}
-
-
-class ControlRequest(BaseModel):
-    action: str                     # next | previous | goto | pause | resume | repeat | end
-    slide_number: Optional[int] = None
-
-
-@app.post("/api/sessions/{session_id}/control", summary="Manual presenter control")
-async def control_session(session_id: str, body: ControlRequest):
-    session = _get_or_404(session_id)
-    await session.manual_control(body.action, body.slide_number)
-    return {"message": f"Action '{body.action}' executed"}
-
-
-class TranscriptRequest(BaseModel):
-    text: str
-
-
-@app.post("/api/sessions/{session_id}/transcript", summary="Submit a voice transcript")
-async def submit_transcript(session_id: str, body: TranscriptRequest):
-    """
-    Accepts transcripts from:
-    - The browser (Web Speech API via dashboard)
-    - Recall.ai webhook proxy
-    - Deepgram direct push
-    """
-    session = _get_or_404(session_id)
-    asyncio.create_task(session.process_transcript(body.text))
-    return {"message": "Processing"}
-
-
-@app.post("/api/sessions/{session_id}/end", summary="End the session")
-async def end_session(session_id: str):
-    session = _get_or_404(session_id)
-    await session.end()
-    return {"message": "Session ended"}
-
-
-# ------------------------------------------------------------------ #
-# Recall.ai webhook
-# ------------------------------------------------------------------ #
-
-@app.post("/webhook/recall/{session_id}", include_in_schema=False)
-async def recall_webhook(session_id: str, payload: dict):
-    """Receives real-time transcripts from Recall.ai."""
-    from meeting.recall_bot import RecallBot
-
-    text = RecallBot.parse_transcript_webhook(payload)
-    if text and session_id in sessions:
-        asyncio.create_task(sessions[session_id].process_transcript(text))
-    return {"ok": True}
-
-
-# ------------------------------------------------------------------ #
-# Audio file serving
-# ------------------------------------------------------------------ #
-
-@app.get("/audio/{session_id}/{filename}", include_in_schema=False)
-async def serve_audio(session_id: str, filename: str):
-    path = os.path.join(config.AUDIO_CACHE_DIR, f"session_{session_id}_{filename}")
-    if not os.path.exists(path):
-        raise HTTPException(404, "Audio not found")
-    return FileResponse(path, media_type="audio/mpeg")
-
-
-# ------------------------------------------------------------------ #
-# Slide image serving
-# ------------------------------------------------------------------ #
-
-@app.get("/slides/{session_id}/{filename}", include_in_schema=False)
-async def serve_slide_image(session_id: str, filename: str):
-    path = os.path.join("slide_images", session_id, filename)
-    if not os.path.exists(path):
-        raise HTTPException(404, "Slide image not found")
-    return FileResponse(path, media_type="image/png")
-
-
-# ------------------------------------------------------------------ #
-# WebSocket — real-time event stream
-# ------------------------------------------------------------------ #
-
-@app.websocket("/ws/{session_id}")
-async def websocket_endpoint(websocket: WebSocket, session_id: str):
-    if session_id not in sessions:
-        await websocket.close(code=4004, reason="Session not found")
-        return
-
-    await websocket.accept()
-    ws_clients[session_id].append(websocket)
-    logger.info("WebSocket connected: %s", session_id)
-
-    # Push current state immediately on connect
-    await websocket.send_json({
-        "type": "status",
-        "data": sessions[session_id].status(),
-        "timestamp": "",
-    })
-
-    try:
-        while True:
-            raw = await websocket.receive_text()
-            try:
-                import json
-                msg = json.loads(raw)
-                # Client can push transcripts via WebSocket too
-                if msg.get("type") == "transcript" and "text" in msg:
-                    asyncio.create_task(
-                        sessions[session_id].process_transcript(msg["text"])
-                    )
-                elif msg.get("type") == "control":
-                    asyncio.create_task(
-                        sessions[session_id].manual_control(
-                            msg.get("action", ""),
-                            msg.get("slide_number"),
-                        )
-                    )
-            except Exception as exc:
-                logger.debug("WS message parse error: %s", exc)
-
-    except WebSocketDisconnect:
-        if websocket in ws_clients.get(session_id, []):
-            ws_clients[session_id].remove(websocket)
-        logger.info("WebSocket disconnected: %s", session_id)
-
-
-# ------------------------------------------------------------------ #
-# Helpers
-# ------------------------------------------------------------------ #
-
-def _get_or_404(session_id: str) -> PresentationSession:
-    session = sessions.get(session_id)
-    if not session:
-        raise HTTPException(404, f"Session '{session_id}' not found")
-    return session
+    slide_app_module.app._start_callback = _cb  # type: ignore[attr-defined]
+    # Patch the module-level variable used in app.py
+    import slide_server.app as _sa
+    _sa._start_callback = _cb
 
 
 # ------------------------------------------------------------------ #
 # Entry point
 # ------------------------------------------------------------------ #
 
-if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(
-        "main:app",
-        host=config.HOST,
-        port=config.PORT,
-        reload=True,
-        log_level="info",
+def main():
+    parser = argparse.ArgumentParser(description="AI Meeting Presenter")
+    parser.add_argument("--meeting-url", default=None,
+                        help="Zoom/Meet URL to join immediately")
+    parser.add_argument("--slides", default=None,
+                        help="Path to PPTX or PDF to load immediately")
+    args = parser.parse_args()
+
+    # Ensure storage directories exist
+    os.makedirs("uploads", exist_ok=True)
+    os.makedirs("slide_images", exist_ok=True)
+
+    # Pre-load slides if provided via CLI
+    if args.slides:
+        count = slide_manager.load(args.slides)
+        logger.info("Loaded %d slides from %s", count, args.slides)
+
+    _setup_start_callback()
+
+    # Start slide server in background thread
+    server_thread = threading.Thread(target=_run_slide_server, daemon=True)
+    server_thread.start()
+    logger.info(
+        "Slide server running at http://%s:%d",
+        "localhost", config.SLIDE_SERVER_PORT,
     )
+
+    # Graceful shutdown
+    def _shutdown(sig, _frame):
+        logger.info("Shutting down…")
+        raise SystemExit(0)
+
+    signal.signal(signal.SIGINT, _shutdown)
+    signal.signal(signal.SIGTERM, _shutdown)
+
+    if args.meeting_url:
+        # CLI mode: start presentation immediately
+        if not slide_manager.is_loaded:
+            logger.error("No slides loaded. Pass --slides path/to/deck.pptx")
+            raise SystemExit(1)
+        logger.info("Starting presentation for %s", args.meeting_url)
+        asyncio.run(_run_presenter(args.meeting_url))
+    else:
+        # UI mode: wait for user to start via browser
+        logger.info(
+            "\n"
+            "  ┌─────────────────────────────────────────┐\n"
+            "  │  Open http://localhost:%d in your browser │\n"
+            "  │  Upload slides and enter your Zoom URL   │\n"
+            "  └─────────────────────────────────────────┘",
+            config.SLIDE_SERVER_PORT,
+        )
+        server_thread.join()
+
+
+if __name__ == "__main__":
+    main()
