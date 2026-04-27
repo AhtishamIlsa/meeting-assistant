@@ -1,0 +1,591 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>AI Meeting Presenter</title>
+  <script src="https://cdn.tailwindcss.com"></script>
+  <style>
+    :root { color-scheme: dark; }
+    body { background: #0a0e1a; font-family: 'Inter', system-ui, sans-serif; }
+    .glass { background: rgba(255,255,255,0.05); border: 1px solid rgba(255,255,255,0.1); backdrop-filter: blur(12px); }
+    .glow-blue { box-shadow: 0 0 20px rgba(59,130,246,0.3); }
+    .glow-green { box-shadow: 0 0 20px rgba(34,197,94,0.3); }
+    .pulse-dot { animation: pulse 2s infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.4} }
+    .slide-in { animation: slideIn .3s ease; }
+    @keyframes slideIn { from{opacity:0;transform:translateY(8px)} to{opacity:1;transform:none} }
+    .transcript-item { animation: fadeIn .4s ease; }
+    @keyframes fadeIn { from{opacity:0;transform:translateX(-8px)} to{opacity:1;transform:none} }
+    ::-webkit-scrollbar { width: 4px; }
+    ::-webkit-scrollbar-track { background: transparent; }
+    ::-webkit-scrollbar-thumb { background: rgba(255,255,255,0.15); border-radius: 2px; }
+    #slidePreview { background: linear-gradient(135deg,#1e2942,#0f172a); }
+    .state-badge.idle      { background:#374151; }
+    .state-badge.joining   { background:#1d4ed8; animation: pulse 1.5s infinite; }
+    .state-badge.presenting{ background:#15803d; }
+    .state-badge.speaking  { background:#7e22ce; animation: pulse 1.5s infinite; }
+    .state-badge.listening { background:#0369a1; animation: pulse 2s infinite; }
+    .state-badge.paused    { background:#92400e; }
+    .state-badge.ended     { background:#374151; }
+    .state-badge.error     { background:#991b1b; }
+  </style>
+</head>
+<body class="text-white min-h-screen">
+
+  <!-- ═══════════════════ HEADER ═══════════════════ -->
+  <header class="glass border-b border-white/10 px-6 py-4 flex items-center justify-between">
+    <div class="flex items-center gap-3">
+      <div class="w-9 h-9 rounded-xl bg-gradient-to-br from-blue-500 to-purple-600 flex items-center justify-center text-lg">🤖</div>
+      <div>
+        <h1 class="text-lg font-bold tracking-tight">AI Meeting Presenter</h1>
+        <p class="text-xs text-gray-400">Autonomous AI sales agent</p>
+      </div>
+    </div>
+    <div class="flex items-center gap-4">
+      <span id="stateBadge" class="state-badge idle text-xs font-semibold px-3 py-1 rounded-full uppercase tracking-wider">IDLE</span>
+      <span id="wsIndicator" class="text-xs text-gray-500 flex items-center gap-1">
+        <span class="w-2 h-2 rounded-full bg-gray-500"></span> Disconnected
+      </span>
+    </div>
+  </header>
+
+  <!-- ═══════════════════ SETUP PANEL ═══════════════════ -->
+  <div id="setupPanel" class="max-w-2xl mx-auto mt-16 px-4">
+    <div class="glass rounded-2xl p-8 glow-blue">
+      <h2 class="text-2xl font-bold mb-2">Start a Presentation</h2>
+      <p class="text-gray-400 mb-8 text-sm">Upload your slides, optionally add a Zoom link, and the AI will present and interact with your client autonomously.</p>
+
+      <!-- Step 1: Create Session -->
+      <div class="mb-6">
+        <button id="btnCreateSession"
+          class="w-full bg-blue-600 hover:bg-blue-500 transition rounded-xl py-3 font-semibold text-sm flex items-center justify-center gap-2">
+          <span>✨</span> Create New Session
+        </button>
+      </div>
+
+      <!-- Step 2: Upload Slides -->
+      <div id="uploadSection" class="hidden mb-6">
+        <label class="block text-sm font-medium text-gray-300 mb-2">📊 Upload Slides (PPTX or PDF)</label>
+        <div id="dropZone"
+          class="border-2 border-dashed border-white/20 rounded-xl p-8 text-center cursor-pointer hover:border-blue-500 hover:bg-blue-500/5 transition"
+          ondragover="event.preventDefault()" ondrop="handleDrop(event)" onclick="document.getElementById('fileInput').click()">
+          <div class="text-4xl mb-3">📁</div>
+          <p class="text-gray-400 text-sm">Drag & drop or <span class="text-blue-400 underline">browse</span></p>
+          <p class="text-gray-600 text-xs mt-1">PPTX, PPT, or PDF</p>
+        </div>
+        <input type="file" id="fileInput" accept=".pptx,.ppt,.pdf" class="hidden" onchange="uploadFile(this.files[0])" />
+        <div id="uploadStatus" class="mt-2 text-sm text-gray-400 hidden"></div>
+      </div>
+
+      <!-- Step 3: Meeting URL -->
+      <div id="meetingSection" class="hidden mb-6">
+        <label class="block text-sm font-medium text-gray-300 mb-2">🎥 Zoom Meeting URL (optional)</label>
+        <input id="meetingUrl" type="url" placeholder="https://zoom.us/j/..."
+          class="w-full bg-white/5 border border-white/10 rounded-xl px-4 py-3 text-sm focus:outline-none focus:border-blue-500 focus:ring-1 focus:ring-blue-500" />
+        <p class="text-xs text-gray-500 mt-1">Leave blank to use manual/demo mode without a real meeting</p>
+      </div>
+
+      <!-- Step 4: Start -->
+      <div id="startSection" class="hidden">
+        <button id="btnStart"
+          class="w-full bg-gradient-to-r from-green-600 to-emerald-500 hover:from-green-500 hover:to-emerald-400 transition rounded-xl py-3 font-semibold text-sm flex items-center justify-center gap-2">
+          <span>🚀</span> Start AI Presentation
+        </button>
+      </div>
+
+      <div id="sessionInfo" class="hidden mt-4 p-3 bg-white/5 rounded-lg text-xs text-gray-400">
+        Session: <span id="sessionIdDisplay" class="font-mono text-blue-400"></span>
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════ PRESENTER VIEW ═══════════════════ -->
+  <div id="presenterView" class="hidden px-4 py-6 max-w-screen-2xl mx-auto">
+    <div class="grid grid-cols-1 xl:grid-cols-3 gap-6">
+
+      <!-- LEFT: Slide View -->
+      <div class="xl:col-span-2 space-y-4">
+
+        <!-- Slide canvas -->
+        <div class="glass rounded-2xl overflow-hidden">
+          <div id="slidePreview" class="relative aspect-video flex items-center justify-center min-h-64 p-8">
+            <div id="slideImageWrap" class="hidden absolute inset-0">
+              <img id="slideImage" src="" alt="Slide" class="w-full h-full object-contain" />
+            </div>
+            <div id="slideTextWrap" class="relative z-10 text-center max-w-3xl">
+              <h2 id="slideTitle" class="text-3xl font-bold mb-4 text-white/90"></h2>
+              <p id="slideContent" class="text-gray-300 text-sm leading-relaxed whitespace-pre-line"></p>
+            </div>
+          </div>
+
+          <!-- Controls bar -->
+          <div class="flex items-center justify-between px-4 py-3 border-t border-white/10">
+            <div class="flex items-center gap-2">
+              <button onclick="control('previous')" title="Previous slide"
+                class="p-2 rounded-lg hover:bg-white/10 transition text-gray-300 hover:text-white">◀</button>
+              <span id="slideCounter" class="text-sm text-gray-400 font-mono">— / —</span>
+              <button onclick="control('next')" title="Next slide"
+                class="p-2 rounded-lg hover:bg-white/10 transition text-gray-300 hover:text-white">▶</button>
+            </div>
+
+            <div class="flex items-center gap-2">
+              <button onclick="control('repeat')" title="Repeat slide"
+                class="p-2 rounded-lg hover:bg-white/10 transition text-gray-300 hover:text-white text-sm">🔁</button>
+              <button id="btnPauseResume" onclick="togglePause()" title="Pause / Resume"
+                class="p-2 rounded-lg hover:bg-white/10 transition text-gray-300 hover:text-white text-sm">⏸</button>
+              <button onclick="endSession()" title="End session"
+                class="px-3 py-1.5 rounded-lg bg-red-700/40 hover:bg-red-600/60 transition text-red-300 text-xs font-medium">End</button>
+            </div>
+          </div>
+        </div>
+
+        <!-- Narration display -->
+        <div class="glass rounded-2xl p-4">
+          <div class="flex items-center gap-2 mb-2">
+            <span class="text-purple-400 text-sm font-semibold">🗣 AI Speaking</span>
+            <span id="speakingIndicator" class="hidden pulse-dot w-2 h-2 rounded-full bg-purple-400"></span>
+          </div>
+          <p id="narrationText" class="text-gray-300 text-sm leading-relaxed italic">&mdash;</p>
+        </div>
+
+        <!-- Slide jump bar -->
+        <div class="glass rounded-xl px-4 py-3 flex items-center gap-3">
+          <span class="text-xs text-gray-500">Jump to slide:</span>
+          <input id="gotoInput" type="number" min="1" placeholder="e.g. 3"
+            class="w-20 bg-white/5 border border-white/10 rounded-lg px-3 py-1 text-sm focus:outline-none focus:border-blue-500" />
+          <button onclick="gotoSlide()"
+            class="text-xs bg-blue-700/50 hover:bg-blue-600/60 transition px-3 py-1.5 rounded-lg">Go</button>
+        </div>
+      </div>
+
+      <!-- RIGHT: Activity Panel -->
+      <div class="space-y-4">
+
+        <!-- Meeting & session info -->
+        <div class="glass rounded-2xl p-4 space-y-2">
+          <h3 class="text-sm font-semibold text-gray-300 mb-3">📡 Session Info</h3>
+          <div class="text-xs space-y-1.5">
+            <div class="flex justify-between">
+              <span class="text-gray-500">Session ID</span>
+              <span id="infoSessionId" class="font-mono text-blue-400 text-xs truncate max-w-32"></span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-gray-500">State</span>
+              <span id="infoState" class="text-green-400 font-medium">—</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-gray-500">Meeting</span>
+              <span id="infoMeeting" class="text-gray-300 truncate max-w-36">—</span>
+            </div>
+            <div class="flex justify-between">
+              <span class="text-gray-500">Slides</span>
+              <span id="infoSlides" class="text-gray-300">—</span>
+            </div>
+          </div>
+        </div>
+
+        <!-- Microphone input (Web Speech API) -->
+        <div class="glass rounded-2xl p-4">
+          <div class="flex items-center justify-between mb-3">
+            <h3 class="text-sm font-semibold text-gray-300">🎤 Client Voice Input</h3>
+            <button id="btnMic" onclick="toggleMic()"
+              class="px-3 py-1.5 rounded-lg bg-gray-700 hover:bg-gray-600 transition text-xs font-medium">
+              Start Listening
+            </button>
+          </div>
+          <div id="micStatus" class="text-xs text-gray-500">Microphone off</div>
+          <div id="interimTranscript" class="text-xs text-yellow-400/70 italic mt-1 min-h-4"></div>
+        </div>
+
+        <!-- Live transcript feed -->
+        <div class="glass rounded-2xl p-4 flex flex-col" style="max-height:220px">
+          <h3 class="text-sm font-semibold text-gray-300 mb-3 flex-shrink-0">💬 Transcript</h3>
+          <div id="transcriptFeed" class="flex-1 overflow-y-auto space-y-2 text-xs"></div>
+        </div>
+
+        <!-- AI action log -->
+        <div class="glass rounded-2xl p-4 flex flex-col" style="max-height:280px">
+          <h3 class="text-sm font-semibold text-gray-300 mb-3 flex-shrink-0">🧠 AI Actions</h3>
+          <div id="actionFeed" class="flex-1 overflow-y-auto space-y-2 text-xs"></div>
+        </div>
+
+        <!-- Audio player -->
+        <div class="glass rounded-2xl p-4">
+          <h3 class="text-sm font-semibold text-gray-300 mb-2">🔊 Presenter Audio</h3>
+          <audio id="audioPlayer" controls class="w-full h-8 opacity-80"
+            style="filter: invert(1) hue-rotate(180deg)"></audio>
+        </div>
+
+      </div>
+    </div>
+  </div>
+
+  <!-- ═══════════════════ TOAST ═══════════════════ -->
+  <div id="toast" class="fixed bottom-6 right-6 hidden glass rounded-xl px-4 py-3 text-sm max-w-xs slide-in z-50"></div>
+
+  <!-- ═══════════════════ SCRIPT ═══════════════════ -->
+  <script>
+    // ── State ──────────────────────────────────────────────────────────
+    let sessionId = null;
+    let ws = null;
+    let isPaused = false;
+    let recognition = null;
+    let micActive = false;
+    let totalSlides = 0;
+    let slidesLoaded = false;
+
+    const API = (path) => `/api${path}`;
+
+    // ── Session ────────────────────────────────────────────────────────
+    document.getElementById('btnCreateSession').addEventListener('click', async () => {
+      const btn = document.getElementById('btnCreateSession');
+      btn.disabled = true;
+      btn.textContent = 'Creating…';
+      try {
+        const res = await fetch(API('/sessions'), { method: 'POST' });
+        const data = await res.json();
+        sessionId = data.session_id;
+        document.getElementById('sessionIdDisplay').textContent = sessionId;
+        document.getElementById('sessionInfo').classList.remove('hidden');
+        document.getElementById('uploadSection').classList.remove('hidden');
+        document.getElementById('meetingSection').classList.remove('hidden');
+        btn.textContent = '✅ Session Created';
+        btn.classList.replace('bg-blue-600', 'bg-gray-700');
+        connectWs();
+      } catch (e) {
+        toast('Failed to create session', 'error');
+        btn.disabled = false;
+        btn.textContent = '✨ Create New Session';
+      }
+    });
+
+    async function uploadFile(file) {
+      if (!file || !sessionId) return;
+      const status = document.getElementById('uploadStatus');
+      status.classList.remove('hidden');
+      status.textContent = `Uploading ${file.name}…`;
+      const form = new FormData();
+      form.append('file', file);
+      try {
+        const res = await fetch(API(`/sessions/${sessionId}/slides`), { method: 'POST', body: form });
+        if (!res.ok) throw new Error((await res.json()).detail);
+        const data = await res.json();
+        status.textContent = `✅ ${data.slides_count} slides loaded from "${data.filename}"`;
+        status.classList.add('text-green-400');
+        document.getElementById('dropZone').classList.add('border-green-500/50', 'bg-green-500/5');
+        totalSlides = data.slides_count;
+        slidesLoaded = true;
+        document.getElementById('startSection').classList.remove('hidden');
+      } catch (e) {
+        status.textContent = `❌ ${e.message}`;
+        status.classList.add('text-red-400');
+      }
+    }
+
+    function handleDrop(e) {
+      e.preventDefault();
+      const file = e.dataTransfer.files[0];
+      if (file) uploadFile(file);
+    }
+
+    document.getElementById('btnStart').addEventListener('click', async () => {
+      const btn = document.getElementById('btnStart');
+      btn.disabled = true;
+      btn.textContent = 'Starting…';
+      const meetingUrl = document.getElementById('meetingUrl').value.trim() || null;
+      try {
+        await fetch(API(`/sessions/${sessionId}/start`), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ meeting_url: meetingUrl }),
+        });
+        showPresenterView();
+      } catch (e) {
+        toast('Failed to start: ' + e.message, 'error');
+        btn.disabled = false;
+        btn.textContent = '🚀 Start AI Presentation';
+      }
+    });
+
+    // ── WebSocket ──────────────────────────────────────────────────────
+    function connectWs() {
+      if (!sessionId) return;
+      const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+      ws = new WebSocket(`${proto}://${location.host}/ws/${sessionId}`);
+      const ind = document.getElementById('wsIndicator');
+
+      ws.onopen = () => {
+        ind.innerHTML = '<span class="w-2 h-2 rounded-full bg-green-500 pulse-dot"></span> Live';
+        ind.classList.replace('text-gray-500', 'text-green-400');
+      };
+      ws.onclose = () => {
+        ind.innerHTML = '<span class="w-2 h-2 rounded-full bg-gray-500"></span> Disconnected';
+        ind.classList.replace('text-green-400', 'text-gray-500');
+        setTimeout(connectWs, 3000); // auto-reconnect
+      };
+      ws.onerror = () => ws.close();
+      ws.onmessage = (e) => handleEvent(JSON.parse(e.data));
+    }
+
+    // ── Event Handler ──────────────────────────────────────────────────
+    function handleEvent(ev) {
+      const { type, data } = ev;
+
+      if (type === 'state_change') {
+        updateState(data.state, data.message);
+      } else if (type === 'status') {
+        if (data.state) updateState(data.state);
+        if (data.current_slide) updateSlideDisplay(data.current_slide);
+        if (data.total_slides) totalSlides = data.total_slides;
+        updateInfoPanel(data);
+      } else if (type === 'slide_change') {
+        updateSlideDisplay(data);
+        totalSlides = data.total;
+        updateSlideCounter(data.number || data.index + 1, data.total);
+      } else if (type === 'narration') {
+        document.getElementById('narrationText').textContent = data.text;
+        document.getElementById('speakingIndicator').classList.remove('hidden');
+      } else if (type === 'audio_ready') {
+        playAudio(data.url || data.path);
+        setTimeout(() => document.getElementById('speakingIndicator').classList.add('hidden'), 3000);
+      } else if (type === 'transcript') {
+        addTranscript(data.text);
+      } else if (type === 'ai_action') {
+        addAIAction(data);
+      } else if (type === 'slides_loaded') {
+        totalSlides = data.count;
+        toast(`✅ ${data.count} slides loaded`, 'success');
+      } else if (type === 'bot_joined') {
+        toast(data.demo ? '🤖 Demo mode (no live bot)' : '🤖 Bot joined the meeting!', 'info');
+      } else if (type === 'warning') {
+        toast('⚠ ' + data.message, 'warn');
+      } else if (type === 'session_ended') {
+        toast('Session ended', 'info');
+        updateState('ended');
+      }
+    }
+
+    function updateState(state, message) {
+      const badge = document.getElementById('stateBadge');
+      badge.textContent = state.toUpperCase();
+      badge.className = `state-badge ${state} text-xs font-semibold px-3 py-1 rounded-full uppercase tracking-wider`;
+      document.getElementById('infoState').textContent = state;
+      isPaused = state === 'paused';
+      document.getElementById('btnPauseResume').textContent = isPaused ? '▶' : '⏸';
+    }
+
+    function updateSlideDisplay(slide) {
+      document.getElementById('slideTitle').textContent = slide.title || '';
+      document.getElementById('slideContent').textContent = slide.content || '';
+      updateSlideCounter(slide.number || (slide.index + 1), slide.total);
+
+      if (slide.image_path) {
+        const imgUrl = `/slides/${sessionId}/slide_${String(slide.index).padStart(3,'0')}.png`;
+        const img = document.getElementById('slideImage');
+        img.src = imgUrl + '?t=' + Date.now();
+        img.onload = () => {
+          document.getElementById('slideImageWrap').classList.remove('hidden');
+          document.getElementById('slideTextWrap').classList.add('opacity-0');
+        };
+        img.onerror = () => {
+          document.getElementById('slideImageWrap').classList.add('hidden');
+          document.getElementById('slideTextWrap').classList.remove('opacity-0');
+        };
+      } else {
+        document.getElementById('slideImageWrap').classList.add('hidden');
+        document.getElementById('slideTextWrap').classList.remove('opacity-0');
+      }
+    }
+
+    function updateSlideCounter(n, total) {
+      document.getElementById('slideCounter').textContent = `${n} / ${total}`;
+    }
+
+    function updateInfoPanel(data) {
+      if (data.session_id) document.getElementById('infoSessionId').textContent = data.session_id.split('-')[0] + '…';
+      if (data.state) document.getElementById('infoState').textContent = data.state;
+      if (data.meeting_url) document.getElementById('infoMeeting').textContent = new URL(data.meeting_url).hostname;
+      if (data.total_slides) document.getElementById('infoSlides').textContent = data.total_slides + ' slides';
+    }
+
+    // ── Transcript ─────────────────────────────────────────────────────
+    function addTranscript(text) {
+      const feed = document.getElementById('transcriptFeed');
+      const el = document.createElement('div');
+      el.className = 'transcript-item flex gap-2 text-gray-300';
+      el.innerHTML = `<span class="text-blue-400 flex-shrink-0">👤</span><span>${escHtml(text)}</span>`;
+      feed.appendChild(el);
+      feed.scrollTop = feed.scrollHeight;
+    }
+
+    // ── AI Actions ─────────────────────────────────────────────────────
+    const actionEmoji = {
+      next_slide: '▶️', prev_slide: '◀️', goto_slide: '🔢',
+      repeat_slide: '🔁', answer_question: '💡', pause: '⏸',
+      resume: '▶', end_presentation: '🏁', ignore: '🔇',
+    };
+
+    function addAIAction(data) {
+      if (data.action === 'ignore') return;
+      const feed = document.getElementById('actionFeed');
+      const el = document.createElement('div');
+      el.className = 'transcript-item glass rounded-lg p-2 space-y-1';
+      const conf = Math.round(data.confidence * 100);
+      const confColor = conf >= 80 ? 'text-green-400' : conf >= 50 ? 'text-yellow-400' : 'text-red-400';
+      el.innerHTML = `
+        <div class="flex items-center gap-2">
+          <span>${actionEmoji[data.action] || '⚡'}</span>
+          <span class="font-medium text-white/80">${data.action.replace('_', ' ')}</span>
+          <span class="ml-auto ${confColor} font-mono">${conf}%</span>
+        </div>
+        ${data.transcript ? `<div class="text-gray-500 italic">"${escHtml(data.transcript)}"</div>` : ''}
+        ${data.response ? `<div class="text-purple-300">${escHtml(data.response)}</div>` : ''}
+      `;
+      feed.appendChild(el);
+      feed.scrollTop = feed.scrollHeight;
+    }
+
+    // ── Audio ──────────────────────────────────────────────────────────
+    function playAudio(url) {
+      const player = document.getElementById('audioPlayer');
+      if (!url) return;
+      // Resolve relative paths via the API server
+      player.src = url.startsWith('http') ? url : url;
+      player.play().catch(() => {});
+    }
+
+    // ── Controls ───────────────────────────────────────────────────────
+    async function control(action, slideNumber) {
+      if (!sessionId) return;
+      await fetch(API(`/sessions/${sessionId}/control`), {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ action, slide_number: slideNumber || null }),
+      });
+    }
+
+    function togglePause() {
+      control(isPaused ? 'resume' : 'pause');
+    }
+
+    function gotoSlide() {
+      const n = parseInt(document.getElementById('gotoInput').value);
+      if (n > 0) control('goto', n);
+    }
+
+    async function endSession() {
+      if (!sessionId || !confirm('End this presentation session?')) return;
+      await fetch(API(`/sessions/${sessionId}/end`), { method: 'POST' });
+    }
+
+    // ── Microphone (Web Speech API) ────────────────────────────────────
+    function toggleMic() {
+      if (micActive) stopMic();
+      else startMic();
+    }
+
+    function startMic() {
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      if (!SpeechRecognition) {
+        toast('Web Speech API not supported in this browser', 'error');
+        return;
+      }
+      recognition = new SpeechRecognition();
+      recognition.continuous = true;
+      recognition.interimResults = true;
+      recognition.lang = 'en-US';
+
+      recognition.onresult = (e) => {
+        let interim = '', final = '';
+        for (let i = e.resultIndex; i < e.results.length; i++) {
+          if (e.results[i].isFinal) final += e.results[i][0].transcript;
+          else interim += e.results[i][0].transcript;
+        }
+        document.getElementById('interimTranscript').textContent = interim;
+        if (final.trim()) {
+          document.getElementById('interimTranscript').textContent = '';
+          sendTranscript(final.trim());
+        }
+      };
+
+      recognition.onerror = (e) => {
+        if (e.error !== 'no-speech') toast('Mic error: ' + e.error, 'error');
+      };
+
+      recognition.onend = () => {
+        if (micActive) recognition.start(); // auto-restart
+      };
+
+      recognition.start();
+      micActive = true;
+      document.getElementById('btnMic').textContent = '🔴 Stop';
+      document.getElementById('btnMic').classList.replace('bg-gray-700', 'bg-red-700');
+      document.getElementById('micStatus').textContent = 'Listening for client speech…';
+      document.getElementById('micStatus').classList.add('text-green-400');
+    }
+
+    function stopMic() {
+      micActive = false;
+      if (recognition) recognition.stop();
+      document.getElementById('btnMic').textContent = 'Start Listening';
+      document.getElementById('btnMic').classList.replace('bg-red-700', 'bg-gray-700');
+      document.getElementById('micStatus').textContent = 'Microphone off';
+      document.getElementById('micStatus').classList.remove('text-green-400');
+      document.getElementById('interimTranscript').textContent = '';
+    }
+
+    async function sendTranscript(text) {
+      if (!sessionId) return;
+      // Prefer WebSocket for lower latency
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ type: 'transcript', text }));
+      } else {
+        await fetch(API(`/sessions/${sessionId}/transcript`), {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ text }),
+        });
+      }
+    }
+
+    // ── View switch ────────────────────────────────────────────────────
+    function showPresenterView() {
+      document.getElementById('setupPanel').classList.add('hidden');
+      document.getElementById('presenterView').classList.remove('hidden');
+      document.getElementById('infoSessionId').textContent = sessionId.split('-')[0] + '…';
+      const url = document.getElementById('meetingUrl').value.trim();
+      if (url) {
+        try { document.getElementById('infoMeeting').textContent = new URL(url).hostname; }
+        catch (_) { document.getElementById('infoMeeting').textContent = url.slice(0, 20) + '…'; }
+      }
+    }
+
+    // ── Toast ──────────────────────────────────────────────────────────
+    let toastTimer;
+    function toast(msg, type = 'info') {
+      const el = document.getElementById('toast');
+      const colors = { success: 'text-green-300', error: 'text-red-300', warn: 'text-yellow-300', info: 'text-blue-300' };
+      el.className = `fixed bottom-6 right-6 glass rounded-xl px-4 py-3 text-sm max-w-xs slide-in z-50 ${colors[type] || ''}`;
+      el.textContent = msg;
+      el.classList.remove('hidden');
+      clearTimeout(toastTimer);
+      toastTimer = setTimeout(() => el.classList.add('hidden'), 4000);
+    }
+
+    // ── Helpers ────────────────────────────────────────────────────────
+    function escHtml(str) {
+      return String(str).replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;').replace(/"/g,'&quot;');
+    }
+
+    // Keyboard shortcuts
+    document.addEventListener('keydown', (e) => {
+      if (!sessionId || e.target.tagName === 'INPUT') return;
+      if (e.key === 'ArrowRight') control('next');
+      if (e.key === 'ArrowLeft') control('previous');
+      if (e.key === ' ') { e.preventDefault(); togglePause(); }
+      if (e.key === 'r' || e.key === 'R') control('repeat');
+    });
+  </script>
+</body>
+</html>
