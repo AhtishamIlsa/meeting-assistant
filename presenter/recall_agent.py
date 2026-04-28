@@ -81,7 +81,6 @@ class RecallPresenterAgent:
     def __init__(self, slide_manager: SlideManager):
         self.manager = slide_manager
         self._last_word_end: float = 0.0
-        self._transcript_id: Optional[str] = None
 
     @property
     def _base(self) -> str:
@@ -204,27 +203,11 @@ class RecallPresenterAgent:
         self, http: httpx.AsyncClient, bot_id: str
     ) -> Optional[str]:
         try:
-            # Resolve transcript artifact ID once from recording entry
-            if not self._transcript_id:
-                bot_resp = await http.get(f"{self._base}/bot/{bot_id}/")
-                bot_resp.raise_for_status()
-                recs = bot_resp.json().get("recordings") or []
-                if not recs:
-                    return None
-                shortcuts = (recs[0].get("media_shortcuts") or {})
-                t = shortcuts.get("transcript") or {}
-                self._transcript_id = t.get("id")
-                if not self._transcript_id:
-                    logger.warning("No transcript artifact yet in recording")
-                    return None
-                logger.info("Transcript artifact ID: %s", self._transcript_id)
-
-            resp = await http.get(f"{self._base}/transcript/{self._transcript_id}/")
+            resp = await http.get(f"{self._base}/bot/{bot_id}/transcript/")
             if not resp.is_success:
                 logger.warning("Transcript poll %s: %s", resp.status_code, resp.text[:200])
                 return None
             data = resp.json()
-            # Log the response format once so we can see the structure
             if not hasattr(self, "_transcript_format_logged"):
                 self._transcript_format_logged = True
                 logger.info("Transcript response sample: %s", str(data)[:800])
@@ -236,25 +219,31 @@ class RecallPresenterAgent:
     def _parse_words(self, data) -> Optional[str]:
         """Convert Recall transcript response → speaker-labelled text, or None if nothing new."""
         new_words: list[tuple[float, str, str]] = []
+        bot_name = config.PRESENTER_NAME.lower()
 
         # Normalise to a flat list of word dicts with speaker, text, end_time
         if isinstance(data, list):
-            # Old format: [{speaker, words:[{text, end_time}]}, ...]
+            # Format: [{speaker, words:[{text, end_time}]}, ...]
             for seg in data:
                 if not isinstance(seg, dict):
                     continue
                 speaker = seg.get("speaker") or "Participant"
+                # Skip bot's own transcribed output_audio
+                if speaker.lower() == bot_name:
+                    continue
                 for w in seg.get("words", []):
                     end = w.get("end_time") or w.get("end_timestamp", 0)
                     if end and end > self._last_word_end:
                         new_words.append((end, speaker, w.get("text", "")))
         elif isinstance(data, dict):
-            # New artifact format: top-level "words" array
+            # Format: top-level "words" array
             raw_words = data.get("words") or []
             for w in raw_words:
                 if not isinstance(w, dict):
                     continue
                 speaker = w.get("speaker") or w.get("speaker_id") or "Participant"
+                if speaker.lower() == bot_name:
+                    continue
                 end = w.get("end_time") or w.get("end_timestamp") or 0
                 if end and end > self._last_word_end:
                     new_words.append((end, speaker, w.get("text", "")))
