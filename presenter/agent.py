@@ -9,7 +9,7 @@ Flow:
   1. Connect to joinly MCP server (StreamableHttpTransport)
   2. Subscribe to transcript://live for real-time utterance events
   3. Build LangGraph ReAct agent with joinly tools + custom slide tools
-  4. Join meeting, share_screen(slide_server_url), narrate first slide
+  4. Join meeting, narrate first slide via speak_text
   5. Loop: each transcript event → run agent → speak_text / navigate_slide
 """
 import asyncio
@@ -64,11 +64,17 @@ class PresenterAgent:
             ):
                 transcript_event.set()
 
-        joinly_settings = json.dumps({
+        joinly_settings_dict: dict = {
             "tts": config.JOINLY_TTS,
             "stt": config.JOINLY_STT,
             "name": config.PRESENTER_NAME,
-        })
+            "share_url": config.SLIDE_SHARE_URL,
+        }
+        if config.ELEVENLABS_API_KEY:
+            joinly_settings_dict["elevenlabs_api_key"] = config.ELEVENLABS_API_KEY
+        if config.DEEPGRAM_API_KEY:
+            joinly_settings_dict["deepgram_api_key"] = config.DEEPGRAM_API_KEY
+        joinly_settings = json.dumps(joinly_settings_dict)
         transport = StreamableHttpTransport(
             url=config.JOINLY_MCP_URL,
             headers={"joinly-settings": joinly_settings},
@@ -91,7 +97,7 @@ class PresenterAgent:
             all_tools = joinly_tools + slide_tools + [end_turn]
 
             llm = init_chat_model("claude-sonnet-4-6", model_provider="anthropic")
-            llm_bound = llm.bind_tools(all_tools, tool_choice="any")
+            llm_bound = llm.bind_tools(all_tools)
             tool_node = ToolNode(all_tools, handle_tool_errors=lambda e: str(e))
 
             agent = create_react_agent(
@@ -101,11 +107,9 @@ class PresenterAgent:
                 checkpointer=MemorySaver(),
             )
 
-            # ── Initialise: join meeting + share screen ──────────────
+            # ── Initialise: join meeting ─────────────────────────────
             logger.info("Joining meeting: %s", meeting_url)
             await client.call_tool("join_meeting", {"meeting_url": meeting_url})
-            logger.info("Starting screen share: %s", config.SLIDE_SHARE_URL)
-            await client.call_tool("share_screen", {"url": config.SLIDE_SHARE_URL})
 
             # ── Trigger first-slide narration ────────────────────────
             first = self.manager.current()

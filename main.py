@@ -51,8 +51,8 @@ def _run_slide_server():
 # ------------------------------------------------------------------ #
 
 async def _run_presenter(meeting_url: str):
-    from presenter.agent import PresenterAgent
-    agent = PresenterAgent(slide_manager)
+    from presenter.recall_agent import RecallPresenterAgent
+    agent = RecallPresenterAgent(slide_manager)
     await agent.run(meeting_url)
 
 
@@ -89,9 +89,34 @@ def main():
                         help="Path to PPTX or PDF to load immediately")
     args = parser.parse_args()
 
-    # Ensure storage directories exist
+    # Ensure storage directories exist; clear rendered image cache on every start
     os.makedirs("uploads", exist_ok=True)
     os.makedirs("slide_images", exist_ok=True)
+    import glob
+    for old in glob.glob("slide_images/slide_*.png"):
+        try:
+            os.remove(old)
+        except OSError:
+            pass
+    for old_pdf in glob.glob("uploads/slides*.pdf"):
+        try:
+            os.remove(old_pdf)
+        except OSError:
+            pass
+    logger.info("Cleared slide image cache and derived PDFs")
+
+    # Auto-load the last uploaded file if it exists (so user doesn't need to re-upload)
+    for ext in (".pptx", ".ppt", ".pdf"):
+        saved = os.path.join("uploads", f"slides{ext}")
+        if os.path.exists(saved):
+            try:
+                count = slide_manager.load(saved)
+                logger.info("Auto-loaded %d slides from %s", count, saved)
+                slide_manager.export_all_images()
+                logger.info("Slide images rendered")
+            except Exception as exc:
+                logger.warning("Could not auto-load %s: %s", saved, exc)
+            break
 
     # Pre-load slides if provided via CLI
     if args.slides:

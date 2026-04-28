@@ -54,7 +54,11 @@ class SlideManager:
         self._current_index = 0
 
         ext = Path(file_path).suffix.lower()
-        if ext in (".pptx", ".ppt"):
+        if ext == ".ppt":
+            file_path = self._convert_ppt_to_pptx(file_path)
+            self._source_path = file_path
+            self._load_pptx(file_path)
+        elif ext == ".pptx":
             self._load_pptx(file_path)
         elif ext == ".pdf":
             self._load_pdf(file_path)
@@ -187,6 +191,22 @@ class SlideManager:
         except Exception as exc:
             logger.warning("PDF render failed for page %d: %s", page_index, exc)
             return None
+
+    def _convert_ppt_to_pptx(self, ppt_path: str) -> str:
+        pptx_path = ppt_path[:-4] + ".pptx"
+        if os.path.exists(pptx_path):
+            return pptx_path
+        try:
+            subprocess.run(
+                ["libreoffice", "--headless", "--convert-to", "pptx",
+                 "--outdir", os.path.dirname(ppt_path) or ".", ppt_path],
+                check=True, capture_output=True, timeout=60,
+            )
+        except Exception as exc:
+            raise ValueError(f"Could not convert .ppt to .pptx (is LibreOffice installed?): {exc}") from exc
+        if not os.path.exists(pptx_path):
+            raise ValueError(f"LibreOffice conversion produced no output for {ppt_path}")
+        return pptx_path
 
     def _pptx_to_pdf(self, pptx_path: str) -> Optional[str]:
         """Convert a PPTX to PDF using LibreOffice (headless). Returns PDF path."""

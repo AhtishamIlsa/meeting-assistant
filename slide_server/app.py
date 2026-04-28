@@ -250,6 +250,19 @@ async def upload_slides(file: UploadFile = File(...)):
     async with aiofiles.open(dest, "wb") as fh:
         await fh.write(await file.read())
 
+    # Clear stale PNG cache AND derived PDF so new slides are rendered fresh
+    import glob
+    for old_img in glob.glob(os.path.join(IMAGE_DIR, "slide_*.png")):
+        try:
+            os.remove(old_img)
+        except OSError:
+            pass
+    for old_pdf in glob.glob(os.path.join(UPLOAD_DIR, "slides*.pdf")):
+        try:
+            os.remove(old_pdf)
+        except OSError:
+            pass
+
     try:
         count = manager.load(dest)
     except Exception as exc:
