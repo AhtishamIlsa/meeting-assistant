@@ -81,8 +81,7 @@ class SlideManager:
                     continue
                 name = shape.name.lower()
                 is_title = "title" in name or (
-                    hasattr(shape, "placeholder_format")
-                    and shape.placeholder_format is not None
+                    shape.is_placeholder
                     and shape.placeholder_format.idx == 0
                 )
                 if is_title:

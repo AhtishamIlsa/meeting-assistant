@@ -291,14 +291,11 @@ class RealtimePresenterAgent:
     # ------------------------------------------------------------------ #
 
     def _joinly_settings(self) -> str:
-        d: dict = {
+        # Only fields accepted by Joinly's Settings model.
+        # API keys (ElevenLabs, Deepgram) must be passed to the Docker
+        # container via --tts-arg / --stt-arg at startup, not here.
+        return json.dumps({
             "tts": config.JOINLY_TTS,
             "stt": config.JOINLY_STT,
             "name": config.PRESENTER_NAME,
-            "share_url": config.SLIDE_SHARE_URL,
-        }
-        if config.ELEVENLABS_API_KEY:
-            d["elevenlabs_api_key"] = config.ELEVENLABS_API_KEY
-        if config.DEEPGRAM_API_KEY:
-            d["deepgram_api_key"] = config.DEEPGRAM_API_KEY
-        return json.dumps(d)
+        })

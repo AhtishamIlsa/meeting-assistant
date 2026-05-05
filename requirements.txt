@@ -14,3 +14,4 @@ fastmcp>=2.10.5
 
 # AI Agent — OpenAI Realtime API + Recall.ai meeting bot
 openai>=1.50.0
+elevenlabs>=2.0.0

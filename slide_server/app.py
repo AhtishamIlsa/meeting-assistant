@@ -9,6 +9,7 @@ POST /api/navigate— Navigate slides {action: next|previous|goto|repeat, slide_
 GET  /slides/{n}  — Serve slide PNG image
 WS   /ws          — Push slide-change events to the /present page
 """
+import asyncio
 import json
 import logging
 import os
@@ -16,7 +17,7 @@ from pathlib import Path
 from typing import Optional
 
 import aiofiles
-from fastapi import FastAPI, File, HTTPException, UploadFile, WebSocket, WebSocketDisconnect
+from fastapi import FastAPI, File, HTTPException, Request, UploadFile, WebSocket, WebSocketDisconnect
 from fastapi.responses import FileResponse, HTMLResponse
 from pydantic import BaseModel
 
@@ -34,6 +35,93 @@ app = FastAPI(title="AI Meeting Presenter — Slide Server")
 # Shared state
 manager = SlideManager(image_dir=IMAGE_DIR)
 _ws_clients: list[WebSocket] = []
+
+# ------------------------------------------------------------------ #
+# Real-time transcript queue
+# Recall pushes transcript events here via /api/recall/events webhook.
+# The presenter agent drains this queue in _poll_loop.
+# ------------------------------------------------------------------ #
+
+recall_transcript_q: asyncio.Queue = asyncio.Queue()
+
+
+@app.post("/api/recall/events")
+async def recall_webhook(request: Request):
+    """Receive real-time transcript events from Recall.ai realtime_endpoints."""
+    try:
+        data = await request.json()
+        event = data.get("event", "unknown")
+        inner = (data.get("data") or {}).get("data") or {}
+        participant = inner.get("participant") or {}
+        speaker = participant.get("name") or inner.get("speaker") or "unknown"
+        words = inner.get("words") or []
+        preview = " ".join(
+            w.get("text") or w.get("word") or ""
+            for w in words[:12]
+            if isinstance(w, dict)
+        ).strip()
+        logger.info(
+            "Recall realtime event: %s speaker=%s preview=%s",
+            event,
+            speaker,
+            preview[:120] or "-",
+        )
+        await recall_transcript_q.put(data)
+    except Exception as exc:
+        body = await request.body()
+        logger.warning("Recall webhook parse error %s — body: %s", exc, body[:200])
+    return {"ok": True}
+
+
+# ------------------------------------------------------------------ #
+# Audio sink registry
+# Maps session_id → (asyncio.Queue, event_loop) for the presenter agent.
+# Recall connects to /ws/audio/{session_id} and we forward raw PCM to
+# the agent's queue using call_soon_threadsafe (cross-loop safe).
+# ------------------------------------------------------------------ #
+
+_audio_sinks: dict[str, tuple[asyncio.Queue, asyncio.AbstractEventLoop]] = {}
+
+
+def register_audio_sink(
+    session_id: str,
+    queue: asyncio.Queue,
+    loop: asyncio.AbstractEventLoop,
+) -> None:
+    """Called by RecallPresenterAgent before the bot is created."""
+    _audio_sinks[session_id] = (queue, loop)
+    logger.info("Audio sink registered: %s", session_id)
+
+
+def unregister_audio_sink(session_id: str) -> None:
+    """Called by RecallPresenterAgent on shutdown."""
+    _audio_sinks.pop(session_id, None)
+    logger.info("Audio sink unregistered: %s", session_id)
+
+
+@app.websocket("/ws/audio/{session_id}")
+async def ws_audio(ws: WebSocket, session_id: str):
+    """
+    Recall pushes raw meeting audio (S16LE 16 kHz mono) here as binary frames.
+    We forward each frame to the presenter agent's asyncio.Queue using
+    call_soon_threadsafe so it is safe to call from a different event loop.
+    """
+    await ws.accept()
+    logger.info("Recall audio WebSocket connected: %s", session_id)
+    sink = _audio_sinks.get(session_id)
+    if not sink:
+        logger.warning("No audio sink registered for session %s — closing", session_id)
+        await ws.close(code=1008)
+        return
+    queue, loop = sink
+    try:
+        while True:
+            data = await ws.receive_bytes()
+            loop.call_soon_threadsafe(queue.put_nowait, data)
+    except WebSocketDisconnect:
+        logger.info("Recall audio WebSocket disconnected: %s", session_id)
+    except Exception as exc:
+        logger.warning("Audio WebSocket error (%s): %s", session_id, exc)
 
 
 # ------------------------------------------------------------------ #
