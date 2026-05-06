@@ -21,6 +21,10 @@ class Config:
     RECALL_TRANSCRIPTION_LANGUAGE: str = os.getenv(
         "RECALL_TRANSCRIPTION_LANGUAGE", "en"
     )
+    RECALL_REALTIME_WS_BASE_URL: str = os.getenv(
+        "RECALL_REALTIME_WS_BASE_URL", ""
+    )
+    RECALL_REALTIME_TOKEN: str = os.getenv("RECALL_REALTIME_TOKEN", "")
 
     # Joinly
     JOINLY_MCP_URL: str = os.getenv("JOINLY_MCP_URL", "http://localhost:8000/mcp/")

@@ -5,8 +5,8 @@ Pipeline:
 
   Recall bot joins meeting
     │
-    ├─► transcript polling every 1 s  (_poll_loop)
-    │       Deepgram → word-level timestamps → deduplicated text
+    ├─► audio_mixed_raw.data over Recall websocket
+    │       raw PCM → local Deepgram STT → transcript text
     │           │
     │     OpenAI Realtime API  (modalities: ["text"])
     │     • text-in / text-out — no audio processing in the model
@@ -29,7 +29,8 @@ End of deck:
   bot summarises questions raised + next steps → stays for Q&A
 
 Concurrent coroutines (asyncio.gather):
-  _poll_loop   — poll Recall transcript → inject turns into Realtime
+  _audio_input_worker — mixed audio websocket data → Deepgram STT
+  _poll_loop   — final STT transcripts → inject turns into Realtime
   _event_handler — RT events → text buffer → _text_out_q + tool calls
   _tts_worker  — ElevenLabs/OpenAI TTS → Recall output_audio
   _auto_advance — engagement timer → check-in → slide advance → summary
@@ -42,7 +43,9 @@ import json
 import logging
 import os
 import time
-from datetime import datetime
+import uuid
+import wave
+from urllib.parse import urlencode, urlparse, urlunparse
 from typing import Optional
 
 import httpx
@@ -51,8 +54,9 @@ from PIL import Image
 
 from config import config
 from presenter.prompt import get_presenter_prompt
-from slide_server.app import recall_transcript_q
+from slide_server.app import register_audio_sink, unregister_audio_sink
 from slide_server.manager import SlideManager
+from voice.stt_engine import create_stt_engine
 
 logger = logging.getLogger(__name__)
 
@@ -104,11 +108,21 @@ class RecallPresenterAgent:
         self.manager = slide_manager
         self._text_out_q: asyncio.Queue[Optional[str]] = asyncio.Queue()
         self._turn_q: asyncio.Queue[Optional[str]] = asyncio.Queue()
-        self._last_word_end: float = 0.0
+        self._audio_in_q: asyncio.Queue[Optional[bytes]] = asyncio.Queue()
+        self._recall_event_q: asyncio.Queue[Optional[dict]] = asyncio.Queue()
+        self._stt_text_q: asyncio.Queue[Optional[str]] = asyncio.Queue()
         self._last_emitted_chunk: str = ""
         self._last_emitted_at: float = 0.0
-        self._realtime_event_seen: bool = False
-        self._realtime_warning_emitted: bool = False
+        self._audio_event_seen: bool = False
+        self._audio_warning_emitted: bool = False
+        self._stt = None
+        self._stt_backend: str = "deepgram"
+        self._participant_speaking: bool = False
+        self._active_speaker: Optional[str] = None
+        self._speech_buffer = bytearray()
+        self._speech_tasks: set[asyncio.Task] = set()
+        self._stt_openai: Optional[AsyncOpenAI] = None
+        self._realtime_session_id: Optional[str] = None
         # Coordination events
         self._user_spoke: asyncio.Event = asyncio.Event()
         self._audio_finished: asyncio.Event = asyncio.Event()
@@ -119,7 +133,6 @@ class RecallPresenterAgent:
         # Meeting memory
         self._questions: list[str] = []
         self._summary_given: bool = False
-        self._recording_id: Optional[str] = None
 
     @property
     def _base(self) -> str:
@@ -139,11 +152,20 @@ class RecallPresenterAgent:
     async def run(self, meeting_url: str) -> None:
         self._text_out_q = asyncio.Queue()
         self._turn_q = asyncio.Queue()
-        self._last_word_end = 0.0
+        self._audio_in_q = asyncio.Queue()
+        self._recall_event_q = asyncio.Queue()
+        self._stt_text_q = asyncio.Queue()
         self._last_emitted_chunk = ""
         self._last_emitted_at = 0.0
-        self._realtime_event_seen = False
-        self._realtime_warning_emitted = False
+        self._audio_event_seen = False
+        self._audio_warning_emitted = False
+        self._stt_backend = "deepgram"
+        self._participant_speaking = False
+        self._active_speaker = None
+        self._speech_buffer = bytearray()
+        self._speech_tasks = set()
+        self._stt_openai = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+        self._realtime_session_id = uuid.uuid4().hex
         self._user_spoke.clear()
         self._audio_finished.clear()
         self._cancel_audio.clear()
@@ -153,106 +175,122 @@ class RecallPresenterAgent:
         self._interrupted = False
         self._questions = []
         self._summary_given = False
-        self._recording_id = None
+        loop = asyncio.get_running_loop()
+        register_audio_sink(
+            self._realtime_session_id,
+            self._audio_in_q,
+            loop,
+            event_queue=self._recall_event_q,
+        )
+        self._start_stt(loop)
 
-        async with httpx.AsyncClient(headers=self._headers, timeout=30) as http:
-            bot_id = await self._create_bot(http, meeting_url)
-            logger.info("Bot created: %s", bot_id)
+        try:
+            async with httpx.AsyncClient(headers=self._headers, timeout=30) as http:
+                bot_id = await self._create_bot(http, meeting_url)
+                logger.info("Bot created: %s", bot_id)
 
-            await self._wait_for_joined(http, bot_id)
-            logger.info("Bot joined meeting")
+                await self._wait_for_joined(http, bot_id)
+                logger.info("Bot joined meeting")
 
-            first = self.manager.current()
-            if first:
-                asyncio.create_task(self._push_slide(http, bot_id, first.index))
-
-            openai_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
-            async with openai_client.beta.realtime.connect(
-                model="gpt-4o-realtime-preview"
-            ) as rt:
-                logger.info("Connected to OpenAI Realtime")
-
-                await rt.session.update(session={
-                    "modalities": ["text"],
-                    "instructions": get_presenter_prompt(config.PRESENTER_NAME),
-                    "tools": _TOOLS,
-                    "tool_choice": "auto",
-                    "temperature": 0.6,
-                })
-
-                tasks = [
-                    asyncio.create_task(
-                        self._turn_worker(rt), name="turn_worker"
-                    ),
-                    asyncio.create_task(
-                        self._poll_loop(rt, http, bot_id), name="poll_loop"
-                    ),
-                    asyncio.create_task(
-                        self._event_handler(rt, http, bot_id), name="event_handler"
-                    ),
-                    asyncio.create_task(
-                        self._tts_worker(http, bot_id), name="tts_worker"
-                    ),
-                    asyncio.create_task(
-                        self._auto_advance(rt, http, bot_id), name="auto_advance"
-                    ),
-                    asyncio.create_task(
-                        self._refresh_participants(rt, http, bot_id),
-                        name="refresh_participants",
-                    ),
-                ]
-
+                first = self.manager.current()
                 if first:
-                    await self._queue_turn(
-                        "The presentation has started. Present slide 1 now.\n\n"
-                        f"SLIDE CONTENT — narrate exactly this:\n{first.summary()}"
-                    )
+                    asyncio.create_task(self._push_slide(http, bot_id, first.index))
 
+                openai_client = AsyncOpenAI(api_key=config.OPENAI_API_KEY)
+                async with openai_client.beta.realtime.connect(
+                    model="gpt-4o-realtime-preview"
+                ) as rt:
+                    logger.info("Connected to OpenAI Realtime")
+
+                    await rt.session.update(session={
+                        "modalities": ["text"],
+                        "instructions": get_presenter_prompt(config.PRESENTER_NAME),
+                        "tools": _TOOLS,
+                        "tool_choice": "auto",
+                        "temperature": 0.6,
+                    })
+
+                    tasks = [
+                        asyncio.create_task(
+                            self._turn_worker(rt), name="turn_worker"
+                        ),
+                        asyncio.create_task(
+                            self._audio_input_worker(), name="audio_input_worker"
+                        ),
+                        asyncio.create_task(
+                            self._recall_event_worker(), name="recall_event_worker"
+                        ),
+                        asyncio.create_task(
+                            self._poll_loop(), name="poll_loop"
+                        ),
+                        asyncio.create_task(
+                            self._event_handler(rt, http, bot_id), name="event_handler"
+                        ),
+                        asyncio.create_task(
+                            self._tts_worker(http, bot_id), name="tts_worker"
+                        ),
+                        asyncio.create_task(
+                            self._auto_advance(rt, http, bot_id), name="auto_advance"
+                        ),
+                        asyncio.create_task(
+                            self._refresh_participants(rt, http, bot_id),
+                            name="refresh_participants",
+                        ),
+                    ]
+
+                    if first:
+                        await self._queue_turn(
+                            "The presentation has started. Present slide 1 now.\n\n"
+                            f"SLIDE CONTENT — narrate exactly this:\n{first.summary()}"
+                        )
+
+                    try:
+                        await asyncio.gather(*tasks)
+                    except Exception:
+                        logger.exception("Pipeline error — shutting down")
+                        for t in tasks:
+                            t.cancel()
+                        raise
+        finally:
+            for task in list(self._speech_tasks):
+                task.cancel()
+            if self._speech_tasks:
+                await asyncio.gather(*self._speech_tasks, return_exceptions=True)
+                self._speech_tasks.clear()
+            if self._stt:
                 try:
-                    await asyncio.gather(*tasks)
+                    self._stt.stop()
                 except Exception:
-                    logger.exception("Pipeline error — shutting down")
-                    for t in tasks:
-                        t.cancel()
-                    raise
+                    logger.exception("Could not stop STT engine cleanly")
+                self._stt = None
+            if self._stt_openai:
+                await self._stt_openai.close()
+                self._stt_openai = None
+            if self._realtime_session_id:
+                unregister_audio_sink(self._realtime_session_id)
 
     # ------------------------------------------------------------------ #
     # Bot lifecycle
     # ------------------------------------------------------------------ #
 
     async def _create_bot(self, http: httpx.AsyncClient, meeting_url: str) -> str:
-        realtime_endpoints = []
-        if config.RECALL_WEBHOOK_URL:
-            webhook = f"{config.RECALL_WEBHOOK_URL.rstrip('/')}/api/recall/events"
-            realtime_endpoints = [{
-                "type": "webhook",
-                "url": webhook,
-                "events": [
-                    "transcript.data",
-                    "participant_events.speech_on",
-                    "participant_events.speech_off",
-                ],
-            }]
-            logger.info("Real-time transcript webhook: %s", webhook)
-        else:
-            logger.warning(
-                "RECALL_WEBHOOK_URL not set — live participant listening will not work. "
-                "Run: cloudflared tunnel --url http://localhost:%s  then set RECALL_WEBHOOK_URL",
-                config.SLIDE_SERVER_PORT,
-            )
-
-        provider = self._build_transcript_provider()
-        logger.info("Using Recall transcript provider: %s", next(iter(provider.keys())))
+        realtime_url = self._build_realtime_ws_url()
+        logger.info("Recall realtime websocket: %s", realtime_url)
 
         payload: dict = {
             "meeting_url": meeting_url,
             "bot_name": config.PRESENTER_NAME,
             "recording_config": {
-                "transcript": {
-                    "provider": provider,
-                    "diarization": {"use_separate_streams_when_available": True},
-                },
-                "realtime_endpoints": realtime_endpoints,
+                "audio_mixed_raw": {},
+                "realtime_endpoints": [{
+                    "type": "websocket",
+                    "url": realtime_url,
+                    "events": [
+                        "audio_mixed_raw.data",
+                        "participant_events.speech_on",
+                        "participant_events.speech_off",
+                    ],
+                }],
             },
         }
         resp = await http.post(f"{self._base}/bot/", json=payload)
@@ -280,35 +318,79 @@ class RecallPresenterAgent:
             await asyncio.sleep(3)
         raise TimeoutError("Bot did not join within 90 s")
 
-    def _build_transcript_provider(self) -> dict:
-        provider = (config.RECALL_TRANSCRIPTION_PROVIDER or "").strip().lower()
-        language = (config.RECALL_TRANSCRIPTION_LANGUAGE or "en").strip()
-        mode = (config.RECALL_TRANSCRIPTION_MODE or "prioritize_low_latency").strip()
-
-        if provider in ("", "recallai", "recallai_streaming"):
-            return {
-                "recallai_streaming": {
-                    "mode": mode,
-                    "language_code": language,
-                }
-            }
-
-        if provider == "deepgram_streaming":
-            cfg: dict[str, object] = {"language": language}
-            if language == "multi":
-                cfg["model"] = "nova-3"
-            return {"deepgram_streaming": cfg}
-
-        logger.warning(
-            "Unknown RECALL_TRANSCRIPTION_PROVIDER=%s — falling back to recallai_streaming",
-            provider,
+    def _build_realtime_ws_url(self) -> str:
+        source = (
+            config.RECALL_REALTIME_WS_BASE_URL.strip()
+            or config.RECALL_WEBHOOK_URL.strip()
         )
-        return {
-            "recallai_streaming": {
-                "mode": "prioritize_low_latency",
-                "language_code": "en",
-            }
-        }
+        if not source:
+            raise RuntimeError(
+                "Set RECALL_REALTIME_WS_BASE_URL to your public ngrok/cloudflared URL "
+                f"that forwards to localhost:{config.SLIDE_SERVER_PORT}"
+            )
+        if not self._realtime_session_id:
+            raise RuntimeError("Realtime session id is not initialised")
+
+        parsed = urlparse(source)
+        if not parsed.scheme or not parsed.netloc:
+            raise RuntimeError(
+                "RECALL_REALTIME_WS_BASE_URL must be a full public URL like "
+                "https://your-subdomain.ngrok-free.app"
+            )
+
+        scheme = {
+            "https": "wss",
+            "http": "ws",
+            "wss": "wss",
+            "ws": "ws",
+        }.get(parsed.scheme, parsed.scheme)
+
+        base_path = ""
+        if config.RECALL_REALTIME_WS_BASE_URL.strip():
+            base_path = parsed.path.rstrip("/")
+
+        path = f"{base_path}/ws/recall/{self._realtime_session_id}"
+        query = ""
+        token = config.RECALL_REALTIME_TOKEN.strip()
+        if token:
+            query = urlencode({"token": token})
+
+        return urlunparse((scheme, parsed.netloc, path, "", query, ""))
+
+    def _start_stt(self, loop: asyncio.AbstractEventLoop) -> None:
+        def _on_transcript(text: str) -> None:
+            loop.call_soon_threadsafe(self._stt_text_q.put_nowait, text)
+
+        def _on_error(exc: Exception) -> None:
+            loop.call_soon_threadsafe(self._enable_openai_stt_fallback, exc)
+
+        try:
+            self._stt = create_stt_engine(_on_transcript, on_error=_on_error)
+            self._stt.start()
+            self._stt_backend = "deepgram"
+            logger.info("Local streaming STT enabled (Deepgram)")
+        except Exception as exc:
+            self._stt = None
+            self._enable_openai_stt_fallback(exc)
+
+    def _enable_openai_stt_fallback(
+        self,
+        exc: Optional[Exception] = None,
+    ) -> None:
+        if self._stt_backend == "openai_segmented":
+            return
+        self._stt_backend = "openai_segmented"
+        self._stt = None
+        self._participant_speaking = False
+        self._active_speaker = None
+        self._speech_buffer = bytearray()
+        if exc:
+            logger.warning(
+                "Deepgram STT unavailable (%s). Falling back to OpenAI segmented transcription.",
+                exc,
+            )
+        else:
+            logger.info("Using OpenAI segmented transcription fallback")
 
     # ------------------------------------------------------------------ #
     # Realtime request scheduling
@@ -406,200 +488,152 @@ class RecallPresenterAgent:
             logger.info("No participant names retrieved")
 
     # ------------------------------------------------------------------ #
-    # Transcript polling
+    # Audio input + STT
     # ------------------------------------------------------------------ #
 
-    async def _poll_loop(self, rt, http: httpx.AsyncClient, bot_id: str) -> None:
-        """
-        Live transcript listener:
-          - Webhook queue (< 1 s): drains Recall realtime_endpoints push events
+    async def _recall_event_worker(self) -> None:
+        while True:
+            payload = await self._recall_event_q.get()
+            try:
+                if payload is None:
+                    return
 
-        Recall's v1.11 real-time transcription flow is webhook/websocket driven.
-        The transcript API is not a live "transcript-so-far" polling API for
-        active calls, so live participant reactions depend on realtime events.
+                event = str(payload.get("event") or "")
+                speaker = str(payload.get("speaker") or "unknown").strip() or "unknown"
+                if speaker.lower() == config.PRESENTER_NAME.lower():
+                    continue
+
+                if event == "participant_events.speech_on":
+                    logger.info("Participant speech started: %s", speaker)
+                    self._user_spoke.set()
+                    self._cancel_audio.set()
+                    self._participant_speaking = True
+                    self._active_speaker = speaker
+                    self._speech_buffer = bytearray()
+                    continue
+
+                if event != "participant_events.speech_off":
+                    continue
+
+                logger.info("Participant speech ended: %s", speaker)
+                active_speaker = self._active_speaker or speaker
+                audio = bytes(self._speech_buffer)
+                self._participant_speaking = False
+                self._active_speaker = None
+                self._speech_buffer = bytearray()
+
+                if (
+                    self._stt_backend == "openai_segmented"
+                    and len(audio) >= 6400
+                ):
+                    task = asyncio.create_task(
+                        self._transcribe_openai_segment(audio, active_speaker),
+                        name="openai_stt_segment",
+                    )
+                    self._speech_tasks.add(task)
+                    task.add_done_callback(self._speech_tasks.discard)
+            finally:
+                self._recall_event_q.task_done()
+
+    async def _audio_input_worker(self) -> None:
+        """
+        Receive raw PCM frames from the Recall websocket endpoint and push them
+        into the local Deepgram streaming connection.
         """
         start_wait = time.monotonic()
 
         while True:
-            chunk: Optional[str] = None
-
-            if config.RECALL_WEBHOOK_URL:
-                segments: list[dict] = []
-                try:
-                    while True:
-                        event = recall_transcript_q.get_nowait()
-                        self._realtime_event_seen = True
-                        segments.extend(self._extract_transcript_segments(event))
-                except asyncio.QueueEmpty:
-                    pass
-                if segments:
-                    chunk = self._parse_words(segments)
-
-            await asyncio.sleep(0.5)
-
-            if (
-                config.RECALL_WEBHOOK_URL
-                and not self._realtime_event_seen
-                and not self._realtime_warning_emitted
-                and time.monotonic() - start_wait > 20
-            ):
-                self._realtime_warning_emitted = True
-                logger.warning(
-                    "No Recall realtime events received after 20s. "
-                    "Participant listening depends on realtime endpoint delivery. "
-                    "Check that %s is still publicly reachable and that Recall transcription is enabled.",
-                    config.RECALL_WEBHOOK_URL,
-                )
-
-            if chunk:
-                if not self._should_emit_chunk(chunk):
-                    continue
-                logger.info("Participant: %s", chunk)
-                self._user_spoke.set()
-                self._cancel_audio.set()
-                for line in chunk.splitlines():
-                    text = line.split(":", 1)[-1].strip()
-                    if text and ("?" in text or any(
-                        text.lower().startswith(w)
-                        for w in ("what", "how", "why", "when", "where",
-                                  "can", "could", "would", "tell", "explain")
-                    )):
-                        self._questions.append(text)
-                await self._queue_turn(chunk)
-
-    def _parse_words(self, data) -> Optional[str]:
-        """
-        Parse Recall transcript segments.
-        Format: list of {participant: {name}, words: [{text, end_timestamp: {relative, absolute}}]}
-        """
-        new_words: list[tuple[float, str, str]] = []
-        bot_name = config.PRESENTER_NAME.lower()
-        synthetic_end = self._last_word_end
-
-        segments = self._extract_transcript_segments(data)
-        for seg in segments:
-            speaker = self._speaker_name(seg)
-            if (
-                not speaker
-                or speaker.lower() == bot_name
-                or seg.get("speaker_role") == "agent"
-            ):
-                continue
-            for w in seg.get("words") or []:
-                text = self._word_text(w)
-                if not text:
-                    continue
-                end = self._word_end(w)
-                if end is None:
-                    synthetic_end += 0.001
-                    end = synthetic_end
-                if end > self._last_word_end:
-                    new_words.append((end, speaker, text))
-
-        if not new_words:
-            return None
-
-        new_words.sort(key=lambda x: x[0])
-        self._last_word_end = new_words[-1][0]
-
-        lines: list[str] = []
-        cur_speaker: Optional[str] = None
-        cur_buf: list[str] = []
-        for _, speaker, word in new_words:
-            if speaker != cur_speaker:
-                if cur_buf:
-                    lines.append(f"{cur_speaker}: {' '.join(cur_buf)}")
-                cur_speaker, cur_buf = speaker, [word]
-            else:
-                cur_buf.append(word)
-        if cur_buf:
-            lines.append(f"{cur_speaker}: {' '.join(cur_buf)}")
-        return "\n".join(lines) or None
-
-    def _extract_transcript_segments(self, payload) -> list[dict]:
-        segments: list[dict] = []
-        stack = [payload]
-        seen: set[int] = set()
-
-        while stack:
-            current = stack.pop()
-            current_id = id(current)
-            if current_id in seen:
-                continue
-            seen.add(current_id)
-
-            if isinstance(current, dict):
-                words = current.get("words")
-                if isinstance(words, list) and words:
-                    segments.append(current)
-                for value in current.values():
-                    if isinstance(value, (dict, list)):
-                        stack.append(value)
-            elif isinstance(current, list):
-                stack.extend(current)
-
-        return segments
-
-    @staticmethod
-    def _speaker_name(segment: dict) -> str:
-        participant = segment.get("participant")
-        if isinstance(participant, dict) and participant.get("name"):
-            return str(participant["name"]).strip()
-        for key in ("speaker", "speaker_name", "participant_name", "name"):
-            value = segment.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        return "Participant"
-
-    @staticmethod
-    def _word_text(word: dict) -> str:
-        for key in ("text", "word", "punctuated_word"):
-            value = word.get(key)
-            if isinstance(value, str) and value.strip():
-                return value.strip()
-        return ""
-
-    @staticmethod
-    def _as_float(value) -> Optional[float]:
-        if isinstance(value, (int, float)):
-            return float(value)
-        if isinstance(value, str):
             try:
-                return float(value)
-            except ValueError:
-                return None
-        return None
+                audio = await asyncio.wait_for(self._audio_in_q.get(), timeout=1.0)
+            except asyncio.TimeoutError:
+                if (
+                    not self._audio_event_seen
+                    and not self._audio_warning_emitted
+                    and time.monotonic() - start_wait > 20
+                ):
+                    self._audio_warning_emitted = True
+                    logger.warning(
+                        "No Recall audio websocket data received after 20s. "
+                        "Start ngrok on port %s and set RECALL_REALTIME_WS_BASE_URL "
+                        "to the public https URL for this app.",
+                        config.SLIDE_SERVER_PORT,
+                    )
+                continue
 
-    def _word_end(self, word: dict) -> Optional[float]:
-        end_timestamp = word.get("end_timestamp")
-        if isinstance(end_timestamp, dict):
-            for key in ("relative", "seconds", "time"):
-                value = self._as_float(end_timestamp.get(key))
-                if value is not None:
-                    return value
-            absolute = end_timestamp.get("absolute")
-            if isinstance(absolute, str):
-                try:
-                    return datetime.fromisoformat(
-                        absolute.replace("Z", "+00:00")
-                    ).timestamp()
-                except ValueError:
-                    pass
-        else:
-            value = self._as_float(end_timestamp)
-            if value is not None:
-                return value
+            if audio is None:
+                return
 
-        for key in ("end", "end_time"):
-            value = self._as_float(word.get(key))
-            if value is not None:
-                return value
+            if not self._audio_event_seen:
+                self._audio_event_seen = True
+                logger.info("Receiving Recall mixed audio stream")
 
-        end_ms = self._as_float(word.get("end_ms"))
-        if end_ms is not None:
-            return end_ms / 1000.0
+            if self._stt_backend == "openai_segmented" and self._participant_speaking:
+                self._speech_buffer.extend(audio)
 
-        return None
+            if self._stt and self._stt_backend == "deepgram":
+                self._stt.send_audio(audio)
+
+    @staticmethod
+    def _pcm_to_wav(audio: bytes) -> bytes:
+        buf = io.BytesIO()
+        with wave.open(buf, "wb") as wav_file:
+            wav_file.setnchannels(1)
+            wav_file.setsampwidth(2)
+            wav_file.setframerate(16000)
+            wav_file.writeframes(audio)
+        return buf.getvalue()
+
+    async def _transcribe_openai_segment(
+        self,
+        audio: bytes,
+        speaker: Optional[str],
+    ) -> None:
+        if not audio or not self._stt_openai:
+            return
+
+        try:
+            wav_bytes = self._pcm_to_wav(audio)
+            result = await self._stt_openai.audio.transcriptions.create(
+                file=("participant.wav", wav_bytes, "audio/wav"),
+                model="gpt-4o-mini-transcribe",
+                language="en",
+            )
+            text = (getattr(result, "text", "") or "").strip()
+            if not text:
+                return
+            if speaker and speaker.lower() != "unknown":
+                text = f"{speaker}: {text}"
+            await self._stt_text_q.put(text)
+        except Exception as exc:
+            logger.warning("OpenAI fallback transcription failed: %s", exc)
+
+    async def _poll_loop(self) -> None:
+        """
+        Final transcript listener:
+          Deepgram final transcripts → Realtime user turns
+        """
+        while True:
+            text = await self._stt_text_q.get()
+            if text is None:
+                return
+
+            chunk = f"Participant: {text.strip()}"
+            if not text.strip():
+                continue
+
+            if not self._should_emit_chunk(chunk):
+                continue
+
+            logger.info("Participant: %s", chunk)
+            self._user_spoke.set()
+            self._cancel_audio.set()
+            if "?" in text or any(
+                text.lower().startswith(w)
+                for w in ("what", "how", "why", "when", "where",
+                          "can", "could", "would", "tell", "explain")
+            ):
+                self._questions.append(text.strip())
+            await self._queue_turn(chunk)
 
     def _should_emit_chunk(self, chunk: str) -> bool:
         normalized = " ".join(chunk.lower().split())
