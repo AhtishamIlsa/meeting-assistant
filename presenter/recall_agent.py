@@ -130,6 +130,9 @@ class RecallPresenterAgent:
         self._rt_idle: asyncio.Event = asyncio.Event()
         self._rt_write_lock: Optional[asyncio.Lock] = None
         self._interrupted: bool = False
+        # Realtime connection handle (set while run() is active)
+        self._rt = None
+        self._response_active: bool = False
         # Meeting memory
         self._questions: list[str] = []
         self._summary_given: bool = False
@@ -173,6 +176,8 @@ class RecallPresenterAgent:
         self._rt_idle.set()
         self._rt_write_lock = asyncio.Lock()
         self._interrupted = False
+        self._rt = None
+        self._response_active = False
         self._questions = []
         self._summary_given = False
         loop = asyncio.get_running_loop()
@@ -200,6 +205,7 @@ class RecallPresenterAgent:
                 async with openai_client.beta.realtime.connect(
                     model="gpt-4o-realtime-preview"
                 ) as rt:
+                    self._rt = rt
                     logger.info("Connected to OpenAI Realtime")
 
                     await rt.session.update(session={
@@ -251,6 +257,9 @@ class RecallPresenterAgent:
                         for t in tasks:
                             t.cancel()
                         raise
+                    finally:
+                        self._rt = None
+                        self._response_active = False
         finally:
             for task in list(self._speech_tasks):
                 task.cancel()
@@ -449,6 +458,26 @@ class RecallPresenterAgent:
         async with self._rt_write_lock:
             await rt.session.update(session={"instructions": instructions})
 
+    async def _cancel_response(self) -> None:
+        """
+        Send response.cancel to the Realtime API when a participant barges in.
+        The server will emit response.cancelled (handled in _event_handler),
+        which sets _rt_idle so the turn_worker can immediately send the new turn.
+        """
+        if not self._response_active or self._rt is None or self._rt_write_lock is None:
+            return
+        async with self._rt_write_lock:
+            if not self._response_active:
+                return  # already cancelled under lock
+            try:
+                await self._rt.response.cancel()
+                logger.info("Barge-in: sent response.cancel to Realtime API")
+            except Exception as exc:
+                logger.warning("response.cancel failed: %s", exc)
+                # Ensure idle is set so the pipeline doesn't stall
+                self._response_active = False
+                self._rt_idle.set()
+
     # ------------------------------------------------------------------ #
     # Participant awareness
     # ------------------------------------------------------------------ #
@@ -510,6 +539,12 @@ class RecallPresenterAgent:
                     self._participant_speaking = True
                     self._active_speaker = speaker
                     self._speech_buffer = bytearray()
+                    # Cancel any in-progress Realtime response so the pipeline
+                    # doesn't keep generating text that the TTS worker would
+                    # queue and play after the barge-in.
+                    asyncio.create_task(
+                        self._cancel_response(), name="barge_in_cancel"
+                    )
                     continue
 
                 if event != "participant_events.speech_off":
@@ -633,6 +668,9 @@ class RecallPresenterAgent:
                           "can", "could", "would", "tell", "explain")
             ):
                 self._questions.append(text.strip())
+            # The old response is cancelled and TTS is stopped — clear the
+            # barge-in signal so the bot's reply to this input can play.
+            self._cancel_audio.clear()
             await self._queue_turn(chunk)
 
     def _should_emit_chunk(self, chunk: str) -> bool:
@@ -670,9 +708,13 @@ class RecallPresenterAgent:
             if t == "response.created":
                 response_text = ""
                 tool_calls = []
+                self._response_active = True
 
             elif t == "response.text.delta":
-                response_text += event.delta
+                # Drop deltas that arrive after a barge-in cancel so we don't
+                # queue stale text for TTS.
+                if not self._cancel_audio.is_set():
+                    response_text += event.delta
 
             elif t == "response.output_item.done":
                 item = event.item
@@ -680,22 +722,37 @@ class RecallPresenterAgent:
                     args = json.loads(item.arguments or "{}")
                     tool_calls.append((item.call_id, item.name, args))
 
+            elif t == "response.cancelled":
+                # Barge-in cancel acknowledged — unblock the turn worker so
+                # the participant's transcript can be sent immediately.
+                logger.info("Realtime response cancelled (barge-in)")
+                self._response_active = False
+                response_text = ""
+                tool_calls = []
+                self._rt_idle.set()
+
             elif t == "response.done":
-                if response_text.strip():
+                self._response_active = False
+                if self._cancel_audio.is_set():
+                    # Barge-in happened; discard any partial text that arrived
+                    # before the cancel was acknowledged.
+                    logger.info("Discarding response text — barge-in in progress")
+                    self._rt_idle.set()
+                elif response_text.strip():
                     logger.info("Queuing TTS: %.120s", response_text)
                     self._text_out_q.put_nowait(response_text)
                 elif not tool_calls:
                     # Nothing to say and no tool call — signal done immediately
                     self._audio_finished.set()
 
-                if tool_calls:
+                if not self._cancel_audio.is_set() and tool_calls:
                     outputs: list[tuple[str, str]] = []
                     for call_id, name, args in tool_calls:
                         result = await self._run_tool(http, bot_id, name, args)
                         logger.info("Tool %s → %.80s", name, result)
                         outputs.append((call_id, result))
                     await self._send_tool_outputs(rt, outputs)
-                else:
+                elif not tool_calls:
                     self._rt_idle.set()
 
                 response_text = ""
@@ -703,6 +760,7 @@ class RecallPresenterAgent:
 
             elif t == "error":
                 logger.error("Realtime error: %s", event)
+                self._response_active = False
                 self._rt_idle.set()
 
     # ------------------------------------------------------------------ #
@@ -773,7 +831,14 @@ class RecallPresenterAgent:
                 self._audio_finished.set()
                 continue
 
-            # Clear cancel flag at start of new utterance
+            # If barge-in was signalled before we even start this utterance,
+            # discard it entirely rather than clearing the flag and speaking.
+            if self._cancel_audio.is_set():
+                logger.info("Dropping queued utterance — barge-in already active")
+                self._audio_finished.set()
+                continue
+
+            # Safe to clear now: no pending barge-in.
             self._cancel_audio.clear()
 
             sentences = self._split_sentences(text)
